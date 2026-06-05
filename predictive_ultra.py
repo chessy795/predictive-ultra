@@ -3031,103 +3031,101 @@ def generate_html_report(result, output_dir="output"):
 
 def generate_html_report_ultra(result, output_dir="output", elapsed_sec=0.0, dataset=""):
     """Generate HTML report using ReportBuilder from ultra_shared.report."""
-    metrics = result["metrics"]
-    class_names = result["class_names"]
-    n_classes = result["n_classes"]
-    model_name = result.get("actual_type", "unknown")
-    feature_mode = (result.get("feature_engineering") or {}).get("mode", "unknown")
-    if not dataset:
-        dataset = "dataset"
+    try:
+        from ultra_shared.report import ReportBuilder, THRESHOLDS
+    except ImportError:
+        return
 
-    report = ReportBuilder(
-        "Predictive Modeling ULTRA",
-        dataset=dataset,
-        n_docs=len(result.get("y_test", [])) + len(result.get("y_train", [])),
-        elapsed_sec=elapsed_sec,
-        extra_header=f"Model: {model_name} · Features: {feature_mode} · {n_classes} classes",
-    )
+    try:
+        import plotly.graph_objects as go
+        import plotly.express as px
+        import pandas as pd
 
-    # Key findings
-    findings = [
-        f"Best model: {model_name}",
-        f"Macro F1: {metrics['macro_f1']:.4f}",
-        f"Accuracy: {metrics['accuracy']:.4f}",
-    ]
-    explanation = result.get("explanation")
-    if explanation and explanation.get("global_importance"):
-        top_feats = [f["feature"] for f in explanation["global_importance"][:3]]
-        findings.append(f"Most important features: {', '.join(top_feats)}")
-    report.add_key_findings(findings)
+        metrics = result.get("metrics", {})
+        predictions = result.get("predictions")
+        class_names = result.get("class_names", [])
+        n_classes = len(class_names)
+        model_name = result.get("actual_type", result.get("model_type", "unknown"))
 
-    # Rationale
-    cv_report = result.get("cv_report")
-    cv_folds_str = str(cv_report.shape[0]) if cv_report is not None else "N/A"
-    report.add_rationale("Model Type", f"{model_name} classifier trained with {feature_mode} features.")
-    report.add_rationale("Feature Mode",
-                         f"{feature_mode} representation with {n_classes} target classes.")
-    report.add_rationale("Cross-Validation",
-                         f"{cv_folds_str}-fold stratified cross-validation used for robust evaluation.")
-
-    # Metrics
-    f1_key = "macro_f1_binary" if n_classes == 2 else "macro_f1_multi"
-    report.add_metric("Macro F1", metrics["macro_f1"],
-                      thresholds=THRESHOLDS.get(f1_key, {}))
-    report.add_metric("Accuracy", metrics["accuracy"],
-                      thresholds=THRESHOLDS.get("accuracy", {}))
-    report.add_metric("Cohen's Kappa", metrics["kappa"],
-                      thresholds=THRESHOLDS.get("kappa", {}))
-    if metrics.get("roc_auc"):
-        report.add_metric("ROC-AUC", metrics["roc_auc"],
-                          thresholds=THRESHOLDS.get("roc_auc", {}))
-
-    # Per-class metrics table
-    per_class = metrics.get("per_class", {})
-    if per_class:
-        rows = []
-        for cls_idx, cm_data in per_class.items():
-            cname = class_names[int(cls_idx)] if int(cls_idx) < len(class_names) else str(cls_idx)
-            rows.append({
-                "Class": cname,
-                "Precision": cm_data["precision"],
-                "Recall": cm_data["recall"],
-                "F1": cm_data["f1"],
-                "Support": int(cm_data["support"]),
-            })
-        report.add_table(pd.DataFrame(rows), title="Per-Class Metrics")
-
-    # Predictions table
-    y_test = result["y_test"]
-    y_pred = result["y_pred"]
-    pred_df = pd.DataFrame({
-        "true_label": [class_names[i] for i in y_test],
-        "pred_label": [class_names[i] for i in y_pred],
-    })
-    if result["y_prob"] is not None:
-        for i, cname in enumerate(class_names):
-            pred_df[f"prob_{cname}"] = result["y_prob"][:, i]
-    hover = {f"prob_{cname}": f"Predicted probability for class '{cname}'"
-             for cname in class_names}
-    report.add_table(pred_df, title="Predictions", hover_cols=hover)
-    report.set_csv_data(pred_df)
-
-    # Confusion matrix chart (Plotly heatmap)
-    if HAS_PLOTLY:
-        cm = confusion_matrix(y_test, y_pred)
-        fig = go.Figure(data=go.Heatmap(
-            z=cm, x=class_names, y=class_names,
-            colorscale="Blues", text=cm, texttemplate="%{text}",
-            hovertemplate="True: %{y}<br>Predicted: %{x}<br>Count: %{z}<extra></extra>",
-        ))
-        fig.update_layout(
-            title="Confusion Matrix", xaxis_title="Predicted", yaxis_title="True",
-            yaxis=dict(autorange="reversed"), margin=dict(l=80, b=80),
+        report = ReportBuilder(
+            "Predictive Modeling ULTRA",
+            dataset=dataset, n_docs=len(predictions) if predictions is not None else 0,
+            elapsed_sec=elapsed_sec,
+            extra_header=f"Model: {model_name}, Features: {result.get('feature_mode', 'tfidf')}",
         )
-        report.add_chart(fig, title="Confusion Matrix")
 
-    report.build(os.path.join(output_dir, "report.html"))
-    report.build_csv(os.path.join(output_dir, "raw_output.csv"))
-    print(f"\n  ReportBuilder report saved to {output_dir}/report.html")
-    print(f"  ReportBuilder CSV saved to {output_dir}/raw_output.csv")
+        # --- KEY FINDINGS ---
+        findings = []
+        macro_f1 = metrics.get("macro_f1", 0)
+        accuracy = metrics.get("accuracy", 0)
+        findings.append(f"Model: {model_name}, Feature mode: {result.get('feature_mode', 'tfidf')}")
+        findings.append(f"Macro F1: {macro_f1:.4f}, Accuracy: {accuracy:.4f}")
+        kappa = metrics.get("kappa")
+        if kappa is not None:
+            findings.append(f"Cohen's kappa: {kappa:.4f}")
+        explanation = result.get("explanation")
+        if explanation and explanation.get("global_importance"):
+            top_feats = [f["feature"] for f in explanation["global_importance"][:3]]
+            findings.append(f"Most important features: {', '.join(top_feats)}")
+        if predictions is not None:
+            n_correct = (predictions["true_label"] == predictions["pred_label"]).sum()
+            n_total = len(predictions)
+            findings.append(f"Correct: {n_correct}/{n_total} ({n_correct/n_total*100:.1f}%)")
+        report.add_key_findings(findings[:7])
+
+        # --- RATIONALE ---
+        report.add_rationale("Model", f"{model_name} classifier with {result.get('feature_mode', 'tfidf')} features, {n_classes} classes.")
+        report.add_rationale("Evaluation", "Stratified cross-validation with macro-averaged metrics.")
+
+        # --- METRICS ---
+        f1_key = "macro_f1_binary" if n_classes == 2 else "macro_f1_multi"
+        report.add_metric("Macro F1", macro_f1, thresholds=THRESHOLDS.get(f1_key))
+        report.add_metric("Accuracy", accuracy, thresholds=THRESHOLDS.get("accuracy"))
+        if kappa is not None:
+            report.add_metric("Cohen's kappa", kappa, thresholds=THRESHOLDS.get("kappa"))
+        roc = metrics.get("roc_auc")
+        if roc is not None:
+            report.add_metric("ROC AUC", roc, thresholds=THRESHOLDS.get("roc_auc"))
+
+        # --- CHARTS ---
+        if predictions is not None and n_classes >= 2:
+            # Confusion matrix
+            cm = pd.crosstab(predictions["true_label"], predictions["pred_label"])
+            fig_cm = go.Figure(data=go.Heatmap(
+                z=cm.values, x=cm.columns.tolist(), y=cm.index.tolist(),
+                colorscale="Blues", text=cm.values, texttemplate="%{text}",
+                textfont={"size": 14}))
+            fig_cm.update_layout(xaxis_title="Predicted", yaxis_title="True", title="Confusion Matrix")
+            report.add_chart(fig_cm, title="Confusion Matrix")
+
+        # --- TABLES ---
+        # Per-class metrics
+        per_class = metrics.get("per_class", {})
+        if per_class:
+            pc_df = pd.DataFrame(per_class).T.reset_index()
+            pc_df.columns = ["class", "precision", "recall", "f1", "support"][:len(pc_df.columns)]
+            for col in ["precision", "recall", "f1"]:
+                if col in pc_df.columns:
+                    pc_df[col] = pc_df[col].round(4)
+            report.add_table(pc_df, title="Per-Class Metrics")
+
+        # Predictions table
+        if predictions is not None:
+            pred_df = predictions.copy()
+            pred_df["correct"] = pred_df["true_label"] == pred_df["pred_label"]
+            pred_df = pred_df[["true_label", "pred_label", "correct"] +
+                              [c for c in pred_df.columns if c.startswith("prob_")][:5]]
+            report.add_table(pred_df, title="Predictions (first 100)", max_rows=100)
+
+        # Feature importance
+        if explanation and explanation.get("global_importance"):
+            feat_df = pd.DataFrame(explanation["global_importance"][:20])
+            report.add_table(feat_df, title="Feature Importance (Top 20)")
+
+        report.build(os.path.join(output_dir, "report.html"))
+        report.build_csv(os.path.join(output_dir, "raw_output.csv"))
+    except Exception as e:
+        print(f"  [!] ReportBuilder error: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
