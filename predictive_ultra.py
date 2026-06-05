@@ -682,8 +682,8 @@ def run_threshold_optimization(y_true, y_prob):
 # SECTION 5: EXPLAINABILITY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def explain_model(model, X_test, feature_names, explain_mode="shap",
-                  max_features=30):
+def explain_model(model, X_test, y_test=None, feature_names=None,
+                  explain_mode="shap", max_features=30):
     """Generate model explanations."""
     print(f"\n{'='*60}")
     print("EXPLAINABILITY")
@@ -776,7 +776,7 @@ def explain_model(model, X_test, feature_names, explain_mode="shap",
             if issparse(X_perm):
                 X_perm = X_perm.toarray()
             perm = permutation_importance(
-                model, X_perm, y_test,
+                model, X_perm, y_test if y_test is not None else np.zeros(X_perm.shape[0]),
                 n_repeats=10, random_state=42, n_jobs=-1,
             )
             top_indices = np.argsort(perm.importances_mean)[-max_features:][::-1]
@@ -1215,7 +1215,7 @@ def train_classifier(df, text_col="text", label_col="label",
     explanation = None
     if explain_mode != "none":
         explanation = explain_model(
-            model, X_test[:500], feature_names, explain_mode, 30)
+            model, X_test[:500], y_test, feature_names, explain_mode, 30)
 
     # Build result
     result = {
