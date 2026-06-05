@@ -60,6 +60,11 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 # ─── Shared infrastructure (ultra_shared, optional) ──────────────────────────
+import sys as _sys
+_ultra_parent = str(Path(__file__).resolve().parent.parent)
+if _ultra_parent not in _sys.path:
+    _sys.path.insert(0, _ultra_parent)
+
 try:
     from ultra_shared.logging import setup_logging
     from ultra_shared.config import merge_config, load_config
@@ -68,6 +73,12 @@ try:
     HAS_ULTRA_SHARED = True
 except ImportError:
     HAS_ULTRA_SHARED = False
+
+try:
+    from ultra_shared.schema import build_manifest, new_doc, add_tool_section, write_docs_jsonl, write_manifest
+    HAS_SCHEMA = True
+except ImportError:
+    HAS_SCHEMA = False
 
 # ─── Optional imports ─────────────────────────────────────────────────────────
 try:
@@ -1575,6 +1586,27 @@ def save_artifacts(result, output_dir):
     pred_df.to_csv(os.path.join(output_dir, "predictions.csv"),
                    index=False, encoding="utf-8-sig")
 
+    # Ultra output JSONL (unified schema)
+    if HAS_SCHEMA and "test_texts" in result:
+        test_texts = result["test_texts"]
+        y_pred_u = result["y_pred"]
+        y_prob_u = result.get("y_prob")
+        class_names_u = result["class_names"]
+        docs = []
+        for i, (text, pred) in enumerate(zip(test_texts, y_pred_u)):
+            d = new_doc(str(i), text)
+            probs = {}
+            if y_prob_u is not None and i < len(y_prob_u):
+                probs = {cn: round(float(y_prob_u[i][j]), 4) for j, cn in enumerate(class_names_u)}
+            add_tool_section(d, "classification", {
+                "label": class_names_u[int(pred)] if int(pred) < len(class_names_u) else str(pred),
+                "confidence": max(probs.values()) if probs else 0,
+                "probabilities": probs,
+                "model": result.get("actual_type", "unknown"),
+            })
+            docs.append(d)
+        write_docs_jsonl(docs, str(output_dir))
+
     # Error analysis CSV: misclassified examples with confidence
     if "test_texts" in result and result["test_texts"] is not None:
         err_mask = (y_test != y_pred)
@@ -2871,23 +2903,33 @@ Examples:
                 print(f"  Explanations appended to error_analysis.csv")
 
     # Runtime manifest
-    import platform
-    from datetime import datetime, timezone
-    elapsed_total = time.time()  # approximate; use training_time if available
-    manifest = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "n_docs": len(df),
-        "model": result["actual_type"],
-        "features": (result.get("feature_engineering") or {}).get("mode"),
-        "macro_f1": result["metrics"]["macro_f1"],
-        "elapsed_sec": round(result.get("training_time", 0), 2),
-        "python": platform.python_version(),
-        "seed": args.seed,
-    }
-    manifest_path = os.path.join(args.output, "manifest.json")
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, default=str)
-    print(f"  Manifest saved to {manifest_path}")
+    if HAS_SCHEMA:
+        m = build_manifest(
+            "predictive_ultra", len(df), result.get("training_time", 0),
+            input_file=str(args.corpus),
+            parameters={"model": args.model, "features": args.features},
+            extra={"macro_f1": result["metrics"].get("macro_f1"),
+                   "accuracy": result["metrics"].get("accuracy")}
+        )
+        write_manifest(m, str(args.output))
+    else:
+        import platform
+        from datetime import datetime, timezone
+        elapsed_total = time.time()
+        manifest = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "n_docs": len(df),
+            "model": result["actual_type"],
+            "features": (result.get("feature_engineering") or {}).get("mode"),
+            "macro_f1": result["metrics"]["macro_f1"],
+            "elapsed_sec": round(result.get("training_time", 0), 2),
+            "python": platform.python_version(),
+            "seed": args.seed,
+        }
+        manifest_path = os.path.join(args.output, "manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, default=str)
+        print(f"  Manifest saved to {manifest_path}")
 
     # Model card
     generate_model_card(result, args.output)
