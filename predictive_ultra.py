@@ -80,6 +80,12 @@ try:
 except ImportError:
     HAS_SCHEMA = False
 
+try:
+    from ultra_shared.report import ReportBuilder, THRESHOLDS
+    HAS_REPORT_BUILDER = True
+except ImportError:
+    HAS_REPORT_BUILDER = False
+
 # ─── Optional imports ─────────────────────────────────────────────────────────
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
@@ -3023,6 +3029,107 @@ def generate_html_report(result, output_dir="output"):
     return path
 
 
+def generate_html_report_ultra(result, output_dir="output", elapsed_sec=0.0, dataset=""):
+    """Generate HTML report using ReportBuilder from ultra_shared.report."""
+    metrics = result["metrics"]
+    class_names = result["class_names"]
+    n_classes = result["n_classes"]
+    model_name = result.get("actual_type", "unknown")
+    feature_mode = (result.get("feature_engineering") or {}).get("mode", "unknown")
+    if not dataset:
+        dataset = "dataset"
+
+    report = ReportBuilder(
+        "Predictive Modeling ULTRA",
+        dataset=dataset,
+        n_docs=len(result.get("y_test", [])) + len(result.get("y_train", [])),
+        elapsed_sec=elapsed_sec,
+        extra_header=f"Model: {model_name} · Features: {feature_mode} · {n_classes} classes",
+    )
+
+    # Key findings
+    findings = [
+        f"Best model: {model_name}",
+        f"Macro F1: {metrics['macro_f1']:.4f}",
+        f"Accuracy: {metrics['accuracy']:.4f}",
+    ]
+    explanation = result.get("explanation")
+    if explanation and explanation.get("global_importance"):
+        top_feats = [f["feature"] for f in explanation["global_importance"][:3]]
+        findings.append(f"Most important features: {', '.join(top_feats)}")
+    report.add_key_findings(findings)
+
+    # Rationale
+    cv_report = result.get("cv_report")
+    cv_folds_str = str(cv_report.shape[0]) if cv_report is not None else "N/A"
+    report.add_rationale("Model Type", f"{model_name} classifier trained with {feature_mode} features.")
+    report.add_rationale("Feature Mode",
+                         f"{feature_mode} representation with {n_classes} target classes.")
+    report.add_rationale("Cross-Validation",
+                         f"{cv_folds_str}-fold stratified cross-validation used for robust evaluation.")
+
+    # Metrics
+    f1_key = "macro_f1_binary" if n_classes == 2 else "macro_f1_multi"
+    report.add_metric("Macro F1", metrics["macro_f1"],
+                      thresholds=THRESHOLDS.get(f1_key, {}))
+    report.add_metric("Accuracy", metrics["accuracy"],
+                      thresholds=THRESHOLDS.get("accuracy", {}))
+    report.add_metric("Cohen's Kappa", metrics["kappa"],
+                      thresholds=THRESHOLDS.get("kappa", {}))
+    if metrics.get("roc_auc"):
+        report.add_metric("ROC-AUC", metrics["roc_auc"],
+                          thresholds=THRESHOLDS.get("roc_auc", {}))
+
+    # Per-class metrics table
+    per_class = metrics.get("per_class", {})
+    if per_class:
+        rows = []
+        for cls_idx, cm_data in per_class.items():
+            cname = class_names[int(cls_idx)] if int(cls_idx) < len(class_names) else str(cls_idx)
+            rows.append({
+                "Class": cname,
+                "Precision": cm_data["precision"],
+                "Recall": cm_data["recall"],
+                "F1": cm_data["f1"],
+                "Support": int(cm_data["support"]),
+            })
+        report.add_table(pd.DataFrame(rows), title="Per-Class Metrics")
+
+    # Predictions table
+    y_test = result["y_test"]
+    y_pred = result["y_pred"]
+    pred_df = pd.DataFrame({
+        "true_label": [class_names[i] for i in y_test],
+        "pred_label": [class_names[i] for i in y_pred],
+    })
+    if result["y_prob"] is not None:
+        for i, cname in enumerate(class_names):
+            pred_df[f"prob_{cname}"] = result["y_prob"][:, i]
+    hover = {f"prob_{cname}": f"Predicted probability for class '{cname}'"
+             for cname in class_names}
+    report.add_table(pred_df, title="Predictions", hover_cols=hover)
+    report.set_csv_data(pred_df)
+
+    # Confusion matrix chart (Plotly heatmap)
+    if HAS_PLOTLY:
+        cm = confusion_matrix(y_test, y_pred)
+        fig = go.Figure(data=go.Heatmap(
+            z=cm, x=class_names, y=class_names,
+            colorscale="Blues", text=cm, texttemplate="%{text}",
+            hovertemplate="True: %{y}<br>Predicted: %{x}<br>Count: %{z}<extra></extra>",
+        ))
+        fig.update_layout(
+            title="Confusion Matrix", xaxis_title="Predicted", yaxis_title="True",
+            yaxis=dict(autorange="reversed"), margin=dict(l=80, b=80),
+        )
+        report.add_chart(fig, title="Confusion Matrix")
+
+    report.build(os.path.join(output_dir, "report.html"))
+    report.build_csv(os.path.join(output_dir, "raw_output.csv"))
+    print(f"\n  ReportBuilder report saved to {output_dir}/report.html")
+    print(f"  ReportBuilder CSV saved to {output_dir}/raw_output.csv")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3408,6 +3515,12 @@ Examples:
     # HTML report
     if run_all or args.report:
         generate_html_report(result, args.output)
+    if HAS_REPORT_BUILDER:
+        generate_html_report_ultra(
+            result, args.output,
+            elapsed_sec=result.get("training_time", 0),
+            dataset=os.path.basename(args.corpus),
+        )
 
     # Summary
     print(f"\n{'='*60}")
