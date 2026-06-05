@@ -31,7 +31,10 @@ Usage:
   python predictive_ultra.py data.csv text_col label_col --resample smote      # SMOTE oversampling
   python predictive_ultra.py data.csv text_col label_col --calibrate           # probability calibration
   python predictive_ultra.py data.csv text_col label_col --explain shap        # SHAP explanations
+  python predictive_ultra.py data.csv text_col label_col --explain nl          # NL explanations
   python predictive_ultra.py data.csv text_col label_col --cleanlab            # label quality audit
+  python predictive_ultra.py data.csv text_col label_col --learning-curve      # learning curve plot
+  python predictive_ultra.py data.csv text_col label_col --sample 500 --seed 42  # subsample
   python predictive_ultra.py data.csv text_col label_col --all                 # everything
   python predictive_ultra.py data.csv text_col label_col --date date_col       # temporal split
   python predictive_ultra.py data.csv text_col label_col --test data2.csv      # predict on new data
@@ -55,6 +58,16 @@ import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore")
+
+# ─── Shared infrastructure (ultra_shared, optional) ──────────────────────────
+try:
+    from ultra_shared.logging import setup_logging
+    from ultra_shared.config import merge_config, load_config
+    from ultra_shared.cli_base import add_common_args, resolve_output_dir
+    from ultra_shared.cache import EmbeddingCache, cached_embedding
+    HAS_ULTRA_SHARED = True
+except ImportError:
+    HAS_ULTRA_SHARED = False
 
 # ─── Optional imports ─────────────────────────────────────────────────────────
 try:
@@ -257,7 +270,8 @@ TRANSFORMER_MODEL_MAP = {
 def build_features(train_texts, test_texts, feature_mode="tfidf",
                    max_features=12000, ngram_range=(1, 2),
                    embedding_model="all-MiniLM-L6-v2",
-                   train_meta=None, test_meta=None):
+                   train_meta=None, test_meta=None,
+                   cache_dir=None):
     """Build feature matrix from text data.
 
     Modes: tfidf, sbert, tfidf+sbert, distilbert, roberta, mpnet, deberta,
@@ -267,6 +281,7 @@ def build_features(train_texts, test_texts, feature_mode="tfidf",
     vectorizer = None
     embedding_model_obj = None
     scaler = None
+    cache = EmbeddingCache(cache_dir) if cache_dir and HAS_ULTRA_SHARED else None
 
     feature_parts = []
     feature_names = []
@@ -312,8 +327,12 @@ def build_features(train_texts, test_texts, feature_mode="tfidf",
                 all_embs.append(cls_emb)
             return np.vstack(all_embs)
 
-        train_emb2 = _encode(train_texts)
-        test_emb2 = _encode(test_texts)
+        if cache and cache.available:
+            train_emb2 = cache.compute(f"{active_transformer}_train", train_texts, _encode)
+            test_emb2 = cache.compute(f"{active_transformer}_test", test_texts, _encode)
+        else:
+            train_emb2 = _encode(train_texts)
+            test_emb2 = _encode(test_texts)
         scaler2 = StandardScaler()
         train_emb2 = scaler2.fit_transform(train_emb2)
         test_emb2 = scaler2.transform(test_emb2)
@@ -362,6 +381,7 @@ def build_features(train_texts, test_texts, feature_mode="tfidf",
           f"X_train: {X_train.shape}, X_test: {X_test.shape}")
 
     fe = {
+        "mode": feature_mode,
         "X_train": X_train,
         "X_test": X_test,
         "feature_names": feature_names,
@@ -394,7 +414,7 @@ def select_top_features(X_train, y_train, feature_names, k=5000, method="chi2"):
 # SECTION 3: MODEL FACTORY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def make_model(model_type="xgboost_preferred", random_state=42,
+def make_model(model_type="xgboost", random_state=42,
                class_weight_mode=None, n_classes=2,
                n_estimators=100, max_iter=1000,
                scale_pos_weight=None, use_gpu=False):
@@ -810,7 +830,7 @@ def explain_model(model, X_test, feature_names, explain_mode="shap",
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def train_classifier(df, text_col="text", label_col="label",
-                     model_type="xgboost_preferred",
+                     model_type="xgboost",
                      feature_mode="tfidf",
                      split_mode="random_stratified",
                      test_size=0.2, random_state=42,
@@ -825,7 +845,8 @@ def train_classifier(df, text_col="text", label_col="label",
                      n_bootstrap=1000,
                      group_col=None, date_col=None,
                      embedding_model="all-MiniLM-L6-v2",
-                     output_dir="output"):
+                     output_dir="output",
+                     cache_dir=None):
     """Full training pipeline.
 
     Returns dict with all results.
@@ -850,6 +871,8 @@ def train_classifier(df, text_col="text", label_col="label",
 
     # Split
     print(f"\n  Splitting data ({split_mode})...")
+    train_date_range = None
+    test_date_range = None
     if split_mode == "temporal" and date_col and "date" in df.columns:
         df_sorted = df.sort_values("date").reset_index(drop=False)
         split_idx = int(len(df_sorted) * (1 - test_size))
@@ -859,6 +882,17 @@ def train_classifier(df, text_col="text", label_col="label",
         y_train = y_sorted[:split_idx]
         y_test = y_sorted[split_idx:]
         split_info = {"mode": "temporal", "train": split_idx, "test": len(df_sorted) - split_idx}
+        # Print date ranges
+        train_dates = df_sorted["date"].iloc[:split_idx]
+        test_dates = df_sorted["date"].iloc[split_idx:]
+        train_date_range = (train_dates.min(), train_dates.max())
+        test_date_range = (test_dates.min(), test_dates.max())
+        print(f"    Temporal split (chronological, {int((1 - test_size) * 100)}% train / "
+              f"{int(test_size * 100)}% test):")
+        print(f"    Train dates: {train_date_range[0]} → {train_date_range[1]} "
+              f"({len(train_texts)} docs)")
+        print(f"    Test dates:  {test_date_range[0]} → {test_date_range[1]} "
+              f"({len(test_texts)} docs)")
     else:
         train_texts, test_texts, y_train, y_test = train_test_split(
             df["text"].tolist(), y_all,
@@ -870,6 +904,32 @@ def train_classifier(df, text_col="text", label_col="label",
 
     print(f"    Train: {len(train_texts)} docs")
     print(f"    Test:  {len(test_texts)} docs")
+
+    # Scale pos weight for imbalanced binary (initialized here, may be overridden by auto class weight)
+    scale_pos_weight_val = None
+
+    # Auto class weight for imbalanced data
+    if class_weight_mode is None and n_classes == 2:
+        train_class_counts = np.bincount(y_train)
+        minority_pct = train_class_counts.min() / len(y_train) * 100
+        if minority_pct < 15:
+            if model_type in ("xgboost_preferred", "xgb", "xgboost"):
+                if train_class_counts[1] > 0:
+                    ratio = train_class_counts[0] / train_class_counts[1]
+                    print(f"  Auto class weight: minority class {minority_pct:.1f}% < 15% → "
+                          f"scale_pos_weight={ratio:.2f}")
+                    scale_pos_weight_val = ratio
+            else:
+                class_weight_mode = "balanced"
+                print(f"  Auto class weight: minority class {minority_pct:.1f}% < 15% → "
+                      f"class_weight='balanced'")
+    elif class_weight_mode is None and n_classes > 2:
+        train_class_counts = np.bincount(y_train)
+        minority_pct = train_class_counts.min() / len(y_train) * 100
+        if minority_pct < 15:
+            class_weight_mode = "balanced"
+            print(f"  Auto class weight: minority class {minority_pct:.1f}% < 15% → "
+                  f"class_weight='balanced'")
 
     # DistilBERT fine-tuning path (bypasses sklearn feature pipeline)
     if model_type == "distilbert":
@@ -914,7 +974,8 @@ def train_classifier(df, text_col="text", label_col="label",
 
     # Features
     fe = build_features(train_texts, test_texts, feature_mode,
-                        max_features, (1, 2), embedding_model)
+                        max_features, (1, 2), embedding_model,
+                        cache_dir=cache_dir)
     X_train, X_test = fe["X_train"], fe["X_test"]
     feature_names = fe["feature_names"]
 
@@ -938,23 +999,24 @@ def train_classifier(df, text_col="text", label_col="label",
         if use_gpu:
             print(f"  GPU detected — XGBoost will use CUDA")
 
-    # Scale pos weight for imbalanced binary
-    scale_pos_weight_val = None
-    if n_classes == 2 and class_weight_mode == "balanced":
-        class_counts = np.bincount(y_train)
-        if class_counts[0] > 0 and class_counts[1] > 0:
-            scale_pos_weight_val = class_counts[0] / class_counts[1]
-            print(f"  scale_pos_weight: {scale_pos_weight_val:.2f} "
-                  f"(neg={class_counts[0]}, pos={class_counts[1]})")
-
-    # Split train into train/val for early stopping (on feature matrix indices)
+    # Split train into train/val for early stopping (stratified to preserve class balance)
     X_val, y_val = None, None
     if model_type in ("xgboost_preferred", "xgb", "xgboost") and len(train_texts) >= 100:
-        n_val = max(1, int(len(train_texts) * 0.15))
-        rng = np.random.RandomState(random_state)
-        val_idx = rng.choice(len(train_texts), n_val, replace=False)
-        train_idx_inner = np.array([i for i in range(len(train_texts)) if i not in val_idx])
-        print(f"  Early stopping split: train={len(train_idx_inner)}, val={n_val}")
+        from sklearn.model_selection import train_test_split as _es_split
+        _es_idx = np.arange(len(train_texts))
+        try:
+            _train_idx_inner, val_idx = _es_split(
+                _es_idx, y_train, test_size=0.15, random_state=random_state,
+                stratify=y_train,
+            )
+            train_idx_inner = np.sort(_train_idx_inner)
+            val_idx = np.sort(val_idx)
+        except ValueError:
+            rng = np.random.RandomState(random_state)
+            n_val = max(1, int(len(train_texts) * 0.15))
+            val_idx = rng.choice(len(train_texts), n_val, replace=False)
+            train_idx_inner = np.array([i for i in range(len(train_texts)) if i not in val_idx])
+        print(f"  Early stopping split: train={len(train_idx_inner)}, val={len(val_idx)} (stratified)")
     else:
         train_idx_inner = None
 
@@ -1172,10 +1234,15 @@ def train_classifier(df, text_col="text", label_col="label",
         "y_test": y_test,
         "y_pred": y_pred,
         "y_prob": y_prob,
+        "test_texts": test_texts,
         "feature_engineering": fe,
         "label_encoder": le,
         "selector": selector,
         "training_time": train_time,
+        "train_date_range": train_date_range,
+        "test_date_range": test_date_range,
+        "train_texts": train_texts,
+        "y_train": y_train,
     }
 
     # Save artifacts
@@ -1290,7 +1357,7 @@ def train_distilbert(train_texts, train_labels, test_texts, test_labels,
 
 
 def run_comparison(df, output_dir="output", feature_mode="tfidf+sbert",
-                   cv_folds=3, n_bootstrap=500):
+                   cv_folds=3, n_bootstrap=500, cache_dir=None):
     """Run multiple model/feature combinations and compare."""
     MODES = [
         ("XGBoost+TF-IDF", "xgboost", "tfidf"),
@@ -1325,7 +1392,7 @@ def run_comparison(df, output_dir="output", feature_mode="tfidf+sbert",
                 max_features=12000, output_dir=out_sub,
                 cv_folds=cv_folds, n_bootstrap=n_bootstrap,
                 validation_mode="cv", explain_mode="none",
-                calibrate=False,
+                calibrate=False, cache_dir=cache_dir,
             )
             results[name] = {
                 "macro_f1": r["metrics"]["macro_f1"],
@@ -1383,6 +1450,39 @@ def run_comparison(df, output_dir="output", feature_mode="tfidf+sbert",
             verdict = "OK" if abs(delta) < 0.05 else ("OVERFIT ⚠" if delta < -0.05 else "SUSPICIOUS ⚠")
             print(f"{name:<30} {mf1:<10.4f} {cv:<10.4f} {delta:<+10.4f} {verdict:<12}")
 
+    # McNemar's test on all pairs
+    print(f"\n{'='*60}")
+    print("MCNEMAR'S TEST (PAIRWISE COMPARISON)")
+    print(f"{'='*60}")
+    valid_names = [n for n in sorted_names if results[n].get("macro_f1") is not None]
+    mcnemar_pairs = []
+    if len(valid_names) >= 2:
+        print(f"  {'Pair':<55} {'χ²':>8} {'p':>8} {'Sig':>15}")
+        print(f"  {'─'*55} {'─'*8} {'─'*8} {'─'*15}")
+        for i in range(len(valid_names)):
+            for j in range(i + 1, len(valid_names)):
+                n_a, n_b = valid_names[i], valid_names[j]
+                r_a, r_b = results[n_a], results[n_b]
+                y_true_a = r_a.get("y_test")
+                y_pred_a = r_a.get("y_pred")
+                y_true_b = r_b.get("y_test")
+                y_pred_b = r_b.get("y_pred")
+                if y_true_a is not None and y_pred_a is not None and \
+                   y_true_b is not None and y_pred_b is not None and \
+                   len(y_true_a) == len(y_true_b):
+                    chi2, p_val, interp = mcnemar_test(y_true_a, y_pred_a, y_pred_b)
+                    pair_label = f"{n_a} vs {n_b}"
+                    sig_mark = "***" if p_val < 0.001 else ("**" if p_val < 0.01 else ("*" if p_val < 0.05 else "ns"))
+                    print(f"  {pair_label:<55} {chi2:>8.3f} {p_val:>8.4f} {sig_mark:>15}")
+                    mcnemar_pairs.append({
+                        "pair": pair_label, "chi2": round(chi2, 4),
+                        "p_value": round(p_val, 4), "sig": sig_mark,
+                    })
+        if not mcnemar_pairs:
+            print("  No valid pairs for McNemar's test (different test sets or missing predictions)")
+    else:
+        print("  Need at least 2 successful models for pairwise comparison")
+
     # Save comparison
     comp_df = pd.DataFrame([
         {"Model": k, **{kk: vv for kk, vv in v.items() if isinstance(vv, (int, float, str))}}
@@ -1391,6 +1491,13 @@ def run_comparison(df, output_dir="output", feature_mode="tfidf+sbert",
     comp_path = os.path.join(output_dir, "comparison.csv")
     comp_df.to_csv(comp_path, index=False, encoding="utf-8-sig")
     print(f"\n  Comparison saved to {comp_path}")
+
+    # Save McNemar results if any
+    if mcnemar_pairs:
+        mcnemar_df = pd.DataFrame(mcnemar_pairs)
+        mcnemar_path = os.path.join(output_dir, "mcnemar.csv")
+        mcnemar_df.to_csv(mcnemar_path, index=False, encoding="utf-8-sig")
+        print(f"  McNemar results saved to {mcnemar_path}")
 
     return results
 
@@ -1468,6 +1575,60 @@ def save_artifacts(result, output_dir):
     pred_df.to_csv(os.path.join(output_dir, "predictions.csv"),
                    index=False, encoding="utf-8-sig")
 
+    # Error analysis CSV: misclassified examples with confidence
+    if "test_texts" in result and result["test_texts"] is not None:
+        err_mask = (y_test != y_pred)
+        n_err = int(err_mask.sum())
+        if n_err:
+            err_df = pd.DataFrame({
+                "text": [result["test_texts"][i] for i in range(len(y_test)) if err_mask[i]],
+                "true_label": [result["class_names"][int(y_test[i])] for i in range(len(y_test)) if err_mask[i]],
+                "pred_label": [result["class_names"][int(y_pred[i])] for i in range(len(y_test)) if err_mask[i]],
+            })
+            if result["y_prob"] is not None:
+                err_df["pred_confidence"] = [
+                    float(result["y_prob"][i].max()) for i in range(len(y_test)) if err_mask[i]
+                ]
+            err_df.to_csv(os.path.join(output_dir, "error_analysis.csv"),
+                          index=False, encoding="utf-8-sig")
+            print(f"    Error analysis: {n_err} misclassified → error_analysis.csv")
+        else:
+            # 0 misclassifications — write a placeholder so downstream code knows we ran
+            with open(os.path.join(output_dir, "error_analysis.csv"), "w", encoding="utf-8-sig") as f:
+                f.write("text,true_label,pred_label,pred_confidence\n# 0 misclassifications on test set\n")
+            print(f"    Error analysis: 0 misclassifications (perfect test) → error_analysis.csv")
+
+    # Experiment metadata: lets you reproduce / know which config produced this model
+    import json
+    import platform
+    from datetime import datetime, timezone
+    metadata = {
+        "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "model_type": result.get("actual_type"),
+        "class_names": list(result.get("class_names", [])),
+        "metrics": {k: (float(v) if isinstance(v, (int, float, np.floating, np.integer)) else v)
+                    for k, v in (result.get("metrics") or {}).items()
+                    if k not in ("confusion_matrix", "per_class", "classification_report")},
+        "feature_mode": (result.get("feature_engineering") or {}).get("mode"),
+        "training_time_s": result.get("training_time"),
+        "split_info": result.get("split_info"),
+    }
+    fe_cfg = (result.get("feature_engineering") or {}).get("config")
+    if fe_cfg:
+        metadata["feature_config"] = fe_cfg
+    # Feature-engineering shape summary (avoids dumping the giant sparse matrices)
+    fe = result.get("feature_engineering") or {}
+    if fe.get("X_train") is not None:
+        try:
+            metadata["feature_shape"] = {"X_train": list(fe["X_train"].shape),
+                                          "X_test": list(fe["X_test"].shape)}
+        except Exception:
+            pass
+    with open(os.path.join(output_dir, "experiment.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, default=str)
+
     # Feature engineering artifacts
     fe = result["feature_engineering"]
     if HAS_JOBLIB:
@@ -1483,12 +1644,185 @@ def save_artifacts(result, output_dir):
             joblib.dump(result["selector"],
                         os.path.join(output_dir, "feature_selector.joblib"))
 
-    # Model
+    # Model (with metadata stamped on the bundle, not the estimator)
     if HAS_JOBLIB:
+        bundle = {"model": result["model"], "metadata": metadata}
+        joblib.dump(bundle, os.path.join(output_dir, "model.joblib"))
+        # Backwards-compat: bare model file for legacy predict_on_new() consumers
         joblib.dump(result["model"],
-                    os.path.join(output_dir, "model.joblib"))
+                    os.path.join(output_dir, "model_estimator.joblib"))
 
     print(f"\n  Saved artifacts to {output_dir}/")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 7B: NATURAL LANGUAGE EXPLANATION (P6)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def explain_prediction(text, model, vectorizer, class_names, selector=None, top_k=5):
+    """Generate human-readable explanation of why a prediction was made.
+
+    Uses feature importances from tree-based models or coef_ for linear models.
+    Returns: (predicted_label, confidence, explanation_string, top_features)
+    """
+    try:
+        X = vectorizer.transform([text])
+        if selector is not None:
+            X = selector.transform(X)
+        pred = model.predict(X)[0]
+        pred_label = class_names[int(pred)]
+        try:
+            proba = model.predict_proba(X)[0]
+            confidence = float(proba.max())
+        except Exception:
+            confidence = 0.0
+            proba = None
+
+        # Extract feature importances
+        feature_names = vectorizer.get_feature_names_out()
+        importances = None
+        if hasattr(model, "feature_importances_"):
+            importances = model.feature_importances_
+        elif hasattr(model, "coef_"):
+            coefs = model.coef_
+            if coefs.ndim > 1:
+                importances = coefs[int(pred)]
+            else:
+                importances = coefs[0]
+
+        top_features = []
+        if importances is not None:
+            top_idx = np.argsort(np.abs(importances))[-top_k:][::-1]
+            top_features = [(feature_names[i], float(importances[i])) for i in top_idx
+                            if importances[i] != 0]
+
+        explanation_parts = []
+        if top_features:
+            explanation_parts.append(
+                "Top contributing features: " +
+                ", ".join(f'"{f}" ({w:+.3f})' for f, w in top_features[:top_k]))
+        explanation = "; ".join(explanation_parts) if explanation_parts else "No feature-level explanation available"
+
+        return pred_label, confidence, explanation, top_features
+    except Exception as e:
+        return "error", 0.0, f"Explanation failed: {e}", []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 7C: STATISTICAL SIGNIFICANCE FOR MODEL COMPARISON (P16)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def mcnemar_test(y_true, y_pred_a, y_pred_b):
+    """McNemar's test for comparing two classifiers (Dietterich 1998).
+
+    Tests whether two classifiers have significantly different error rates.
+    Returns: chi2 statistic, p-value, interpretation.
+    """
+    # Contingency table:
+    # a: both correct, b: A correct B wrong, c: A wrong B correct, d: both wrong
+    a = sum((y_pred_a == y_true) & (y_pred_b == y_true))
+    b = sum((y_pred_a == y_true) & (y_pred_b != y_true))
+    c = sum((y_pred_a != y_true) & (y_pred_b == y_true))
+    d = sum((y_pred_a != y_true) & (y_pred_b != y_true))
+
+    if b + c == 0:
+        return 0.0, 1.0, "No difference (identical error patterns)"
+
+    # McNemar with continuity correction (Edwards 1948)
+    chi2 = (abs(b - c) - 1) ** 2 / (b + c)
+    # Approximate p-value from chi2 with 1 df
+    try:
+        from scipy.stats import chi2 as chi2_dist
+        p_value = 1 - chi2_dist.cdf(chi2, df=1)
+    except ImportError:
+        # Rough approximation without scipy
+        if chi2 > 6.635:
+            p_value = 0.001
+        elif chi2 > 3.841:
+            p_value = 0.05
+        elif chi2 > 2.706:
+            p_value = 0.10
+        else:
+            p_value = 0.5
+
+    if p_value < 0.001:
+        interp = "Highly significant difference (p < 0.001)"
+    elif p_value < 0.05:
+        interp = f"Significant difference (p = {p_value:.4f})"
+    elif p_value < 0.10:
+        interp = f"Marginal difference (p = {p_value:.4f})"
+    else:
+        interp = f"No significant difference (p = {p_value:.4f})"
+
+    return chi2, p_value, interp
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 7D: LEARNING CURVE (P17)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def plot_learning_curve(model, X, y, output_dir="output", title="Learning Curve"):
+    """Plot accuracy vs training set size — helps diagnose under/overfitting."""
+    if not HAS_PLOTLY:
+        print("  [!] plotly required for learning curve")
+        return
+
+    try:
+        from sklearn.model_selection import learning_curve
+        train_sizes, train_scores, val_scores = learning_curve(
+            model, X, y, cv=min(5, len(y) // 2),
+            train_sizes=np.linspace(0.1, 1.0, 8),
+            scoring="f1_macro", n_jobs=-1)
+
+        train_mean = train_scores.mean(axis=1)
+        train_std = train_scores.std(axis=1)
+        val_mean = val_scores.mean(axis=1)
+        val_std = val_scores.std(axis=1)
+
+        import plotly.graph_objects as go
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=train_sizes.tolist(), y=train_mean.tolist(),
+            mode="lines+markers", name="Training F1",
+            line=dict(color="#3498db")))
+        fig.add_trace(go.Scatter(
+            x=train_sizes.tolist(), y=(train_mean + train_std).tolist(),
+            mode="lines", line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(
+            x=train_sizes.tolist(), y=(train_mean - train_std).tolist(),
+            mode="lines", line=dict(width=0), showlegend=False,
+            fill="none"))
+        fig.add_trace(go.Scatter(
+            x=train_sizes.tolist(), y=val_mean.tolist(),
+            mode="lines+markers", name="Validation F1",
+            line=dict(color="#e74c3c")))
+        fig.add_trace(go.Scatter(
+            x=train_sizes.tolist(), y=(val_mean + val_std).tolist(),
+            mode="lines", line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(
+            x=train_sizes.tolist(), y=(val_mean - val_std).tolist(),
+            mode="lines", line=dict(width=0), showlegend=False,
+            fill="none"))
+        fig.update_layout(title=title, xaxis_title="Training Set Size",
+                          yaxis_title="F1 (macro)", template="plotly_white", height=400)
+
+        # Diagnose
+        gap = train_mean[-1] - val_mean[-1]
+        if gap > 0.15:
+            diagnosis = f"OVERFITTING (gap={gap:.3f}) — need more data or regularization"
+        elif val_mean[-1] < 0.6:
+            diagnosis = f"UNDERFITTING (val_F1={val_mean[-1]:.3f}) — model too simple"
+        else:
+            diagnosis = f"GOOD FIT (val_F1={val_mean[-1]:.3f}, gap={gap:.3f})"
+
+        print(f"  Learning curve diagnosis: {diagnosis}")
+        print(f"  Final train F1: {train_mean[-1]:.3f} | val F1: {val_mean[-1]:.3f}")
+
+        os.makedirs(output_dir, exist_ok=True)
+        fig.write_html(os.path.join(output_dir, "learning_curve.html"))
+        print(f"  Saved learning curve to learning_curve.html")
+    except Exception as e:
+        print(f"  [!] Learning curve failed: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1514,10 +1848,26 @@ def predict_on_new(df_new, output_dir="output"):
         return
 
     model = joblib.load(model_path)
+    metadata = {}
+    if isinstance(model, dict) and "model" in model:
+        # New bundle format: {model, metadata}
+        if model.get("metadata"):
+            metadata = model["metadata"]
+            print(f"  Model trained: {metadata.get('saved_at_utc', '?')}")
+            print(f"  Training metrics: macro_f1={metadata.get('metrics', {}).get('macro_f1', '?')}")
+        model = model["model"]
     vectorizer = joblib.load(vec_path)
     le = joblib.load(le_path)
 
     texts = df_new["text"].tolist()
+
+    # Check if model used non-TF-IDF features (embeddings, SBERT)
+    f_mode = metadata.get("feature_mode")
+    if f_mode and f_mode not in (None, "tfidf", "tfidf+sbert"):
+        f_cfg = metadata.get("feature_config", {})
+        print(f"  [!] Model was trained with '{f_mode}' features")
+        print(f"      Only TF-IDF vectorizer is available for inference")
+        print(f"      Re-train with --features tfidf for standalone prediction")
     X = vectorizer.transform(texts)
 
     y_pred = model.predict(X)
@@ -1740,6 +2090,317 @@ def plot_shap_summary(result, X_test, feature_names, class_names, output_dir="ou
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 9B: PLOTLY CALIBRATION PLOT (per-class reliability diagrams)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def plot_calibration_plotly(result, output_dir="output"):
+    """Generate per-class reliability diagrams using Plotly, saved as calibration_plot.html."""
+    if not HAS_PLOTLY:
+        print("  [!] plotly required for calibration plot")
+        return
+    if result["y_prob"] is None:
+        print("  [!] No probability predictions available for calibration plot")
+        return
+
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    from sklearn.calibration import calibration_curve
+
+    y_test = result["y_test"]
+    y_prob = result["y_prob"]
+    class_names = result["class_names"]
+    n_classes = len(class_names)
+
+    # Determine subplot layout
+    n_cols = min(3, n_classes)
+    n_rows = (n_classes + n_cols - 1) // n_cols
+
+    fig = make_subplots(
+        rows=n_rows, cols=n_cols,
+        subplot_titles=[f"Class: {name}" for name in class_names],
+        horizontal_spacing=0.08, vertical_spacing=0.12,
+    )
+
+    colors = ["#3498db", "#e74c3c", "#2ecc71", "#f39c12", "#9b59b6",
+              "#1abc9c", "#e67e22", "#34495e"]
+
+    for i, class_name in enumerate(class_names):
+        row = i // n_cols + 1
+        col = i % n_cols + 1
+
+        # Binary one-vs-rest: is this class vs rest
+        y_binary = (y_test == i).astype(int)
+        y_class_prob = y_prob[:, i]
+
+        # Skip if class has no test samples
+        if y_binary.sum() < 2 or (y_binary == 0).sum() < 2:
+            continue
+
+        try:
+            prob_true, prob_pred = calibration_curve(
+                y_binary, y_class_prob, n_bins=10, strategy="uniform")
+            ece = float(np.mean(np.abs(prob_true - prob_pred)))
+        except Exception:
+            continue
+
+        color = colors[i % len(colors)]
+
+        # Perfect calibration diagonal
+        fig.add_trace(go.Scatter(
+            x=[0, 1], y=[0, 1], mode="lines",
+            line=dict(dash="dash", color="gray", width=1),
+            showlegend=False,
+        ), row=row, col=col)
+
+        # Reliability diagram
+        fig.add_trace(go.Scatter(
+            x=prob_pred.tolist(), y=prob_true.tolist(),
+            mode="lines+markers",
+            name=f"{class_name} (ECE={ece:.3f})",
+            line=dict(color=color, width=2),
+            marker=dict(size=6),
+            showlegend=(i == 0),  # legend only for first subplot
+        ), row=row, col=col)
+
+    fig.update_layout(
+        title="Per-Class Calibration Reliability Diagrams",
+        height=300 * n_rows,
+        width=400 * n_cols,
+        template="plotly_white",
+        showlegend=True,
+        legend=dict(x=1.02, y=1),
+    )
+
+    # Set axis labels for all subplots
+    for i in range(1, n_rows * n_cols + 1):
+        fig.update_xaxes(title_text="Mean Predicted Probability", row=(i - 1) // n_cols + 1,
+                         col=(i - 1) % n_cols + 1, range=[0, 1])
+        fig.update_yaxes(title_text="Fraction of Positives", row=(i - 1) // n_cols + 1,
+                         col=(i - 1) % n_cols + 1, range=[0, 1])
+
+    out_path = os.path.join(output_dir, "calibration_plot.html")
+    fig.write_html(out_path)
+    print(f"  Saved per-class calibration plot to {out_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 9C: MODEL CARD (model_card.md)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def generate_model_card(result, output_dir="output"):
+    """Generate a model_card.md markdown file with model metadata and metrics."""
+    from datetime import datetime, timezone
+
+    metrics = result["metrics"]
+    class_names = result["class_names"]
+    fe = result.get("feature_engineering", {})
+
+    lines = []
+    lines.append("# Model Card")
+    lines.append("")
+    lines.append(f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    lines.append("")
+
+    # Model info
+    lines.append("## Model Information")
+    lines.append("")
+    lines.append(f"- **Model type:** {result.get('actual_type', 'unknown')}")
+    lines.append(f"- **Feature mode:** {fe.get('mode', 'unknown')}")
+    lines.append(f"- **Training samples:** {result.get('split_info', {}).get('train', 'N/A')}")
+    lines.append(f"- **Test samples:** {result.get('split_info', {}).get('test', 'N/A')}")
+    lines.append(f"- **Number of classes:** {result.get('n_classes', 'N/A')}")
+    lines.append(f"- **Training time:** {result.get('training_time', 0):.2f}s")
+    lines.append("")
+
+    # Feature dimensions
+    if fe.get("X_train") is not None:
+        lines.append(f"- **Feature dimensions (train):** {fe['X_train'].shape}")
+        lines.append(f"- **Feature dimensions (test):** {fe['X_test'].shape}")
+    lines.append("")
+
+    # Metrics
+    lines.append("## Performance Metrics")
+    lines.append("")
+    lines.append("| Metric | Value |")
+    lines.append("|--------|-------|")
+    for key, label in [("accuracy", "Accuracy"), ("macro_f1", "Macro F1"),
+                        ("weighted_f1", "Weighted F1"), ("micro_f1", "Micro F1"),
+                        ("kappa", "Cohen's Kappa"), ("mcc", "MCC"),
+                        ("roc_auc", "ROC-AUC"), ("brier", "Brier Score")]:
+        val = metrics.get(key)
+        if val is not None:
+            lines.append(f"| {label} | {val:.4f} |")
+
+    # Bootstrap CI
+    if metrics.get("bootstrap_ci"):
+        ci = metrics["bootstrap_ci"]
+        lines.append(f"| Bootstrap CI (macro-F1) | [{ci['ci_low']:.4f}, {ci['ci_high']:.4f}] |")
+    lines.append("")
+
+    # Per-class metrics
+    lines.append("## Per-Class Metrics")
+    lines.append("")
+    lines.append("| Class | Precision | Recall | F1 | Support |")
+    lines.append("|-------|-----------|--------|-----|---------|")
+    for cls, cm in metrics.get("per_class", {}).items():
+        name = class_names[int(cls)] if int(cls) < len(class_names) else cls
+        lines.append(f"| {name} | {cm['precision']:.4f} | {cm['recall']:.4f} "
+                     f"| {cm['f1']:.4f} | {cm['support']} |")
+    lines.append("")
+
+    # Class distribution
+    lines.append("## Class Distribution")
+    lines.append("")
+    if result.get("y_test") is not None:
+        from collections import Counter
+        dist = Counter(result["y_test"])
+        total = len(result["y_test"])
+        lines.append("| Class | Count | Percentage |")
+        lines.append("|-------|-------|------------|")
+        for cls_idx in sorted(dist.keys()):
+            name = class_names[cls_idx] if cls_idx < len(class_names) else str(cls_idx)
+            lines.append(f"| {name} | {dist[cls_idx]} | {dist[cls_idx] / total * 100:.1f}% |")
+    lines.append("")
+
+    # Top 10 features
+    lines.append("## Top 10 Features")
+    lines.append("")
+    explanation = result.get("explanation", {})
+    top_feats = explanation.get("global_importance", [])
+    if top_feats:
+        lines.append("| Rank | Feature | Importance |")
+        lines.append("|------|---------|------------|")
+        for i, ft in enumerate(top_feats[:10], 1):
+            lines.append(f"| {i} | `{ft['feature']}` | {ft['importance']:.4f} |")
+    else:
+        lines.append("No feature importance data available.")
+    lines.append("")
+
+    # How to use predict_on_new()
+    lines.append("## Usage: Predicting on New Data")
+    lines.append("")
+    lines.append("```python")
+    lines.append("import pandas as pd")
+    lines.append("from predictive_ultra import predict_on_new")
+    lines.append("")
+    lines.append("# Load new data with a text column")
+    lines.append("df_new = pd.read_csv('new_data.csv')")
+    lines.append("")
+    lines.append("# Predict using the saved model")
+    lines.append("results = predict_on_new(df_new, output_dir='output')")
+    lines.append("print(results[['pred_label', 'prob_*']])")
+    lines.append("```")
+    lines.append("")
+    lines.append("Or from the command line:")
+    lines.append("```bash")
+    lines.append(f"python predictive_ultra.py data.csv text_col label_col --test new_data.csv -o {output_dir}")
+    lines.append("```")
+    lines.append("")
+
+    # Date ranges if temporal
+    if result.get("train_date_range"):
+        lines.append("## Temporal Split Information")
+        lines.append("")
+        td = result["train_date_range"]
+        ts = result["test_date_range"]
+        lines.append(f"- **Train date range:** {td[0]} → {td[1]}")
+        lines.append(f"- **Test date range:** {ts[0]} → {ts[1]}")
+        lines.append("")
+
+    out_path = os.path.join(output_dir, "model_card.md")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"  Model card saved to {out_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 9D: DATA DRIFT CHECK (KS test for temporal split)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def check_data_drift(result, output_dir="output", top_n=20):
+    """Compare TF-IDF feature distributions between train and test using KS test.
+
+    Only runs when temporal split was used. Saves drift_report.csv.
+    """
+    from scipy.stats import ks_2samp
+
+    fe = result.get("feature_engineering", {})
+    X_train = fe.get("X_train")
+    X_test = fe.get("X_test")
+    feature_names = fe.get("feature_names", [])
+
+    if X_train is None or X_test is None:
+        print("  [!] No feature matrices available for drift check")
+        return
+
+    if not feature_names:
+        print("  [!] No feature names available for drift check")
+        return
+
+    # Convert to dense for KS test (use only TF-IDF features)
+    from scipy.sparse import issparse
+    if issparse(X_train):
+        X_train_dense = X_train.toarray()
+    else:
+        X_train_dense = np.asarray(X_train)
+    if issparse(X_test):
+        X_test_dense = X_test.toarray()
+    else:
+        X_test_dense = np.asarray(X_test)
+
+    # Limit to TF-IDF features (skip embedding dims)
+    tfidf_indices = [i for i, n in enumerate(feature_names) if n.startswith("tfidf__")]
+    if not tfidf_indices:
+        tfidf_indices = list(range(min(X_train_dense.shape[1], len(feature_names))))
+
+    # Compute mean absolute value per feature for ranking
+    train_means = np.abs(X_train_dense[:, tfidf_indices]).mean(axis=0)
+    top_feature_indices = np.argsort(train_means)[::-1][:top_n]
+
+    drift_results = []
+    n_significant = 0
+    for rank, local_idx in enumerate(top_feature_indices, 1):
+        global_idx = tfidf_indices[local_idx]
+        feat_name = feature_names[global_idx] if global_idx < len(feature_names) else f"feat_{global_idx}"
+        train_vals = X_train_dense[:, global_idx]
+        test_vals = X_test_dense[:, global_idx]
+
+        ks_stat, p_value = ks_2samp(train_vals, test_vals)
+        significant = "Yes" if p_value < 0.05 else "No"
+        if p_value < 0.05:
+            n_significant += 1
+
+        drift_results.append({
+            "rank": rank,
+            "feature": feat_name,
+            "ks_statistic": round(float(ks_stat), 4),
+            "p_value": round(float(p_value), 6),
+            "significant": significant,
+            "train_mean": round(float(train_means[local_idx]), 4),
+        })
+
+    # Save drift report
+    drift_df = pd.DataFrame(drift_results)
+    drift_path = os.path.join(output_dir, "drift_report.csv")
+    drift_df.to_csv(drift_path, index=False, encoding="utf-8-sig")
+
+    # Print report
+    print(f"\n  Data Drift Report (KS test, top {top_n} TF-IDF features):")
+    print(f"  {'Rank':<6} {'Feature':<40} {'KS stat':>8} {'p-value':>10} {'Shifted':>8}")
+    print(f"  {'─'*6} {'─'*40} {'─'*8} {'─'*10} {'─'*8}")
+    for row in drift_results:
+        sig_mark = "  *" if row["significant"] == "Yes" else ""
+        print(f"  {row['rank']:<6} {row['feature']:<40} {row['ks_statistic']:>8.4f} "
+              f"{row['p_value']:>10.6f} {row['significant']:>8}{sig_mark}")
+    print(f"\n  Significant drift: {n_significant}/{top_n} features (p < 0.05)")
+    if n_significant > top_n * 0.5:
+        print(f"  ⚠ More than 50% of top features shifted — model may not generalise well over time")
+    else:
+        print(f"  ✓ Feature distributions relatively stable between train and test periods")
+    print(f"  Drift report saved to {drift_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 10: HTML REPORT
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1880,6 +2541,8 @@ Examples:
   python predictive_ultra.py data.csv text_col label_col --tune --calibrate --explain shap
   python predictive_ultra.py data.csv text_col label_col --resample smote --cleanlab
   python predictive_ultra.py data.csv text_col label_col --test new_data.csv
+  python predictive_ultra.py data.csv text_col label_col --sample 500 --seed 42
+  python predictive_ultra.py data.csv text_col label_col --learning-curve
         """,
     )
     parser.add_argument("corpus", help="Path to CSV/TSV corpus file")
@@ -1887,8 +2550,8 @@ Examples:
     parser.add_argument("label_col", help="Name of label column")
     parser.add_argument("--output", "-o", default="output", help="Output directory")
     parser.add_argument("--encoding", default="utf-8", help="File encoding")
-    parser.add_argument("--model", default="xgboost_preferred",
-                        help="Model: xgboost, logreg, svm, rf, nb, sgd, ensemble, distilbert")
+    parser.add_argument("--model", default="xgboost",
+                        help="Model type: xgboost, logreg, svm, rf, nb, sgd, ensemble, distilbert (default: xgboost)")
     parser.add_argument("--features", default="tfidf",
                         help="Features: tfidf, sbert, distilbert, roberta, mpnet, deberta, tfidf+{model}")
     parser.add_argument("--split", default="random_stratified",
@@ -1918,8 +2581,36 @@ Examples:
     parser.add_argument("--all", action="store_true", help="Run with all options")
     parser.add_argument("--compare", action="store_true",
                         help="Run multiple model/feature combos and compare")
+    parser.add_argument("--config", "-c", help="Path to YAML/JSON config file")
+    parser.add_argument("--cache-dir", help="Cache directory for embeddings")
+    parser.add_argument("--learning-curve", action="store_true",
+                        help="Plot learning curve after training (requires plotly)")
+    parser.add_argument("--sample", type=int, default=0,
+                        help="Subsample N documents before training (0 = use all)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for sampling and train/test split (default: 42)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Minimal output")
 
     args = parser.parse_args()
+
+    # Load config override if provided
+    if args.config and HAS_ULTRA_SHARED:
+        config_data = load_config(args.config)
+        for k, v in config_data.items():
+            if hasattr(args, k) and getattr(args, k) is not None:
+                continue  # CLI flags take priority
+            setattr(args, k, v)
+
+    # Setup logging
+    if HAS_ULTRA_SHARED:
+        log = setup_logging(
+            verbose=args.verbose,
+            quiet=args.quiet,
+            log_file=os.path.join(args.output, "run.log"),
+        )
+    else:
+        log = None
 
     os.makedirs(args.output, exist_ok=True)
 
@@ -1931,6 +2622,10 @@ Examples:
     print(f"  Model: {args.model}")
     print(f"  Features: {args.features}")
     print(f"  Output: {args.output}")
+    if HAS_ULTRA_SHARED:
+        print(f"  Config: {args.config or '(none)'}")
+        if args.cache_dir:
+            print(f"  Cache: {args.cache_dir}")
 
     # Check dependencies
     missing = []
@@ -1956,6 +2651,31 @@ Examples:
                    args.group, args.date, args.encoding)
     print(f"  Loaded {len(df)} documents ({df['label'].nunique()} classes)")
 
+    # Auto-detect date column for temporal split if --split temporal but no --date
+    if args.split == "temporal" and not args.date:
+        date_candidates = ["date", "year", "createdAt", "created_at",
+                           "timestamp", "publish_date", "pub_date",
+                           "submission_date", "upload_date"]
+        for candidate in date_candidates:
+            if candidate in df.columns:
+                df["date"] = pd.to_datetime(df[candidate], errors="coerce")
+                if df["date"].notna().sum() > 0:
+                    args.date = candidate
+                    print(f"  Auto-detected date column: '{candidate}' "
+                          f"({df['date'].notna().sum()}/{len(df)} valid dates)")
+                    break
+        if not args.date:
+            print("  [!] --split temporal specified but no date column found. "
+                  "Falling back to random stratified split.")
+            args.split = "random_stratified"
+
+    # Subsample if requested
+    if args.sample and args.sample > 0 and args.sample < len(df):
+        rng_sample = np.random.RandomState(args.seed)
+        sample_idx = rng_sample.choice(len(df), args.sample, replace=False)
+        df = df.iloc[sample_idx].reset_index(drop=True)
+        print(f"  Subsampled to {len(df)} documents (seed={args.seed})")
+
     # Preflight
     passed, issues = run_preflight(df, args.label_col)
     if not passed:
@@ -1969,16 +2689,18 @@ Examples:
         args.tune = True
         args.cleanlab = True
         args.resample = args.resample or "smote"
-        args.explain = "shap"
+        args.explain = "nl"
         args.plots = True
         args.report = True
+        args.learning_curve = True
         if not args.group and not args.date:
             pass
 
     # Comparison mode — runs multiple model/feature combos
     if args.compare:
         run_comparison(df, args.output, args.features,
-                       cv_folds=args.cv_folds, n_bootstrap=args.bootstrap)
+                       cv_folds=args.cv_folds, n_bootstrap=args.bootstrap,
+                       cache_dir=args.cache_dir)
         return
 
     # Train
@@ -2004,6 +2726,7 @@ Examples:
         group_col=args.group,
         date_col=args.date,
         output_dir=args.output,
+        cache_dir=args.cache_dir,
     )
 
     # Predict on new data
@@ -2032,6 +2755,142 @@ Examples:
                 result["feature_engineering"]["feature_names"],
                 result["class_names"],
                 args.output)
+
+    # Learning curve
+    if run_all or args.learning_curve:
+        print(f"\n{'='*60}")
+        print("LEARNING CURVE")
+        print(f"{'='*60}")
+        X_for_lc = result["feature_engineering"]["X_train"]
+        if X_for_lc is not None:
+            # Use selected features if selector was applied
+            selector = result.get("selector")
+            if selector is not None:
+                X_for_lc = selector.transform(X_for_lc)
+            y_for_lc = result.get("y_test")  # placeholder; need y_train
+            # We need y_train — reconstruct from split
+            le = result["label_encoder"]
+            y_all_enc = le.transform(df["label"])
+            if result["split_info"]["mode"] == "random_stratified":
+                from sklearn.model_selection import train_test_split as _ts
+                _, _, y_tr, _ = _ts(
+                    df["text"].tolist(), y_all_enc,
+                    test_size=args.test_size, random_state=args.seed,
+                    stratify=y_all_enc,
+                )
+            else:
+                y_tr = y_all_enc
+            plot_learning_curve(
+                result["model"], X_for_lc, y_tr,
+                output_dir=args.output,
+                title=f"Learning Curve — {result['actual_type']}",
+            )
+
+    # Calibration plot (Plotly per-class reliability diagrams)
+    if run_all or args.calibrate:
+        print(f"\n{'='*60}")
+        print("CALIBRATION PLOT")
+        print(f"{'='*60}")
+        plot_calibration_plotly(result, args.output)
+
+    # Data drift check (temporal split only)
+    if args.split == "temporal" and result.get("split_info", {}).get("mode") == "temporal":
+        print(f"\n{'='*60}")
+        print("DATA DRIFT CHECK")
+        print(f"{'='*60}")
+        check_data_drift(result, args.output)
+
+    # NL explanations for --explain nl or --all
+    if args.explain == "nl" and result.get("test_texts") is not None:
+        print(f"\n{'='*60}")
+        print("NATURAL LANGUAGE EXPLANATIONS")
+        print(f"{'='*60}")
+        vec = result["feature_engineering"]["vectorizer"]
+        sel = result.get("selector")
+        class_names = result["class_names"]
+        model_inner = result["model"]
+        y_test = result["y_test"]
+        y_pred = result["y_pred"]
+        test_texts = result["test_texts"]
+        y_prob = result["y_prob"]
+
+        # Top 5 most-confident correct predictions
+        correct_mask = (y_test == y_pred)
+        if correct_mask.sum() > 0:
+            correct_conf = y_prob[correct_mask].max(axis=1) if y_prob is not None else np.zeros(correct_mask.sum())
+            top_correct_idx = np.argsort(correct_conf)[::-1][:5]
+            correct_indices = np.where(correct_mask)[0][top_correct_idx]
+            print(f"\n  Top 5 most-confident CORRECT predictions:")
+            explanations_rows = []
+            for rank, idx in enumerate(correct_indices, 1):
+                text = test_texts[idx]
+                pred_label, confidence, explanation, top_feats = explain_prediction(
+                    text, model_inner, vec, class_names, sel)
+                print(f"    [{rank}] {class_names[int(y_test[idx])]} "
+                      f"(conf={confidence:.3f}) — {explanation[:120]}")
+                explanations_rows.append({
+                    "rank": rank, "category": "correct",
+                    "true_label": class_names[int(y_test[idx])],
+                    "pred_label": pred_label,
+                    "confidence": round(confidence, 4),
+                    "explanation": explanation,
+                    "text": text[:200],
+                })
+
+        # Top 5 errors (highest confidence misclassifications)
+        error_mask = (y_test != y_pred)
+        if error_mask.sum() > 0:
+            error_conf = y_prob[error_mask].max(axis=1) if y_prob is not None else np.zeros(error_mask.sum())
+            top_error_idx = np.argsort(error_conf)[::-1][:5]
+            error_indices = np.where(error_mask)[0][top_error_idx]
+            print(f"\n  Top 5 most-confident ERRORS:")
+            for rank, idx in enumerate(error_indices, 1):
+                text = test_texts[idx]
+                pred_label, confidence, explanation, top_feats = explain_prediction(
+                    text, model_inner, vec, class_names, sel)
+                print(f"    [{rank}] True={class_names[int(y_test[idx])]} "
+                      f"Pred={class_names[int(y_pred[idx])]} "
+                      f"(conf={confidence:.3f}) — {explanation[:120]}")
+                explanations_rows.append({
+                    "rank": rank, "category": "error",
+                    "true_label": class_names[int(y_test[idx])],
+                    "pred_label": pred_label,
+                    "confidence": round(confidence, 4),
+                    "explanation": explanation,
+                    "text": text[:200],
+                })
+
+            # Append explanations to error_analysis.csv
+            if explanations_rows:
+                exp_df = pd.DataFrame(explanations_rows)
+                err_path = os.path.join(args.output, "error_analysis.csv")
+                if os.path.exists(err_path):
+                    existing = pd.read_csv(err_path, encoding="utf-8-sig")
+                    exp_df = pd.concat([existing, exp_df], ignore_index=True)
+                exp_df.to_csv(err_path, index=False, encoding="utf-8-sig")
+                print(f"  Explanations appended to error_analysis.csv")
+
+    # Runtime manifest
+    import platform
+    from datetime import datetime, timezone
+    elapsed_total = time.time()  # approximate; use training_time if available
+    manifest = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "n_docs": len(df),
+        "model": result["actual_type"],
+        "features": (result.get("feature_engineering") or {}).get("mode"),
+        "macro_f1": result["metrics"]["macro_f1"],
+        "elapsed_sec": round(result.get("training_time", 0), 2),
+        "python": platform.python_version(),
+        "seed": args.seed,
+    }
+    manifest_path = os.path.join(args.output, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, default=str)
+    print(f"  Manifest saved to {manifest_path}")
+
+    # Model card
+    generate_model_card(result, args.output)
 
     # HTML report
     if run_all or args.report:

@@ -1,0 +1,34 @@
+# predictive-ultra pinned dependencies
+# Generated: 2026-05-30
+# Run: pip install -r requirements.lock
+
+# Core
+scikit-learn==1.8.0
+xgboost==3.2.0
+pandas==2.2.3
+numpy==2.2.6
+shap==0.51.0
+scipy==1.13.1
+joblib==1.5.3
+imbalanced-learn==0.14.1
+matplotlib==3.10.8
+
+# Optional: tuning / audit
+optuna>=3.0
+cleanlab>=2.0
+
+# Optional: embeddings
+sentence-transformers>=2.2
+
+# Optional: transformer models + DistilBERT fine-tuning
+transformers>=4.30
+torch>=2.0
+
+# Optional: interactive plots
+plotly>=5.15
+
+# Optional: shared infrastructure
+loguru>=0.7
+
+# Optional: YAML config
+PyYAML>=6.0
