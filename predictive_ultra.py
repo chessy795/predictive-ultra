@@ -60,16 +60,16 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 # ─── Shared infrastructure (ultra_shared, optional) ──────────────────────────
-import sys as _sys
 _ultra_parent = str(Path(__file__).resolve().parent.parent)
-if _ultra_parent not in _sys.path:
-    _sys.path.insert(0, _ultra_parent)
+if _ultra_parent not in sys.path:
+    sys.path.insert(0, _ultra_parent)
 
 try:
     from ultra_shared.logging import setup_logging
     from ultra_shared.config import merge_config, load_config
     from ultra_shared.cli_base import add_common_args, resolve_output_dir
     from ultra_shared.cache import EmbeddingCache, cached_embedding
+    from ultra_shared.data import load_documents
     HAS_ULTRA_SHARED = True
 except ImportError:
     HAS_ULTRA_SHARED = False
@@ -838,6 +838,477 @@ def explain_model(model, X_test, y_test=None, feature_names=None,
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 6: TRAINING PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _prepare_labels(y, class_names):
+    """Encode labels and compute auto class weights for imbalanced data.
+
+    Args:
+        y: 1-d array of encoded integer labels (already fit by LabelEncoder).
+        class_names: List of class name strings.
+
+    Returns:
+        dict with keys: class_weight_mode, scale_pos_weight, n_classes.
+    """
+    n_classes = len(class_names)
+    class_weight_mode = None
+    scale_pos_weight = None
+
+    train_class_counts = np.bincount(y)
+    minority_pct = train_class_counts.min() / len(y) * 100
+
+    if minority_pct < 15:
+        if n_classes == 2 and train_class_counts[1] > 0:
+            ratio = train_class_counts[0] / train_class_counts[1]
+            scale_pos_weight = ratio
+            print(f"  Auto class weight: minority class {minority_pct:.1f}% < 15% → "
+                  f"scale_pos_weight={ratio:.2f}")
+        else:
+            class_weight_mode = "balanced"
+            print(f"  Auto class weight: minority class {minority_pct:.1f}% < 15% → "
+                  f"class_weight='balanced'")
+
+    return {
+        "class_weight_mode": class_weight_mode,
+        "scale_pos_weight": scale_pos_weight,
+        "n_classes": n_classes,
+    }
+
+
+def _split_data(df, y_all, split_mode="random_stratified",
+                test_size=0.2, random_state=42, date_col=None):
+    """Split data into train/test sets.
+
+    Args:
+        df: DataFrame with 'text' and optionally 'date' columns.
+        y_all: 1-d array of encoded labels aligned with df.
+        split_mode: 'random_stratified' or 'temporal'.
+        test_size: Fraction held out for testing.
+        random_state: Seed for reproducibility.
+        date_col: Name of date column (used only in temporal mode).
+
+    Returns:
+        dict with keys: train_texts, test_texts, y_train, y_test,
+                        split_info, train_date_range, test_date_range.
+    """
+    train_date_range = None
+    test_date_range = None
+
+    if split_mode == "temporal" and date_col and "date" in df.columns:
+        df_sorted = df.sort_values("date").reset_index(drop=False)
+        split_idx = int(len(df_sorted) * (1 - test_size))
+        train_texts = df_sorted["text"].iloc[:split_idx].tolist()
+        test_texts = df_sorted["text"].iloc[split_idx:].tolist()
+        y_sorted = y_all[df_sorted["index"].values]
+        y_train = y_sorted[:split_idx]
+        y_test = y_sorted[split_idx:]
+        split_info = {"mode": "temporal", "train": split_idx,
+                      "test": len(df_sorted) - split_idx}
+        train_dates = df_sorted["date"].iloc[:split_idx]
+        test_dates = df_sorted["date"].iloc[split_idx:]
+        train_date_range = (train_dates.min(), train_dates.max())
+        test_date_range = (test_dates.min(), test_dates.max())
+        print(f"    Temporal split (chronological, {int((1 - test_size) * 100)}% train / "
+              f"{int(test_size * 100)}% test):")
+        print(f"    Train dates: {train_date_range[0]} → {train_date_range[1]} "
+              f"({len(train_texts)} docs)")
+        print(f"    Test dates:  {test_date_range[0]} → {test_date_range[1]} "
+              f"({len(test_texts)} docs)")
+    else:
+        train_texts, test_texts, y_train, y_test = train_test_split(
+            df["text"].tolist(), y_all,
+            test_size=test_size, random_state=random_state,
+            stratify=y_all,
+        )
+        split_info = {"mode": "random_stratified",
+                      "train": len(train_texts), "test": len(test_texts)}
+
+    print(f"    Train: {len(train_texts)} docs")
+    print(f"    Test:  {len(test_texts)} docs")
+
+    return {
+        "train_texts": train_texts,
+        "test_texts": test_texts,
+        "y_train": y_train,
+        "y_test": y_test,
+        "split_info": split_info,
+        "train_date_range": train_date_range,
+        "test_date_range": test_date_range,
+    }
+
+
+def _build_features(train_texts, test_texts, feature_mode="tfidf",
+                    max_features=12000, embedding_model="all-MiniLM-L6-v2",
+                    cache_dir=None):
+    """Build feature matrices from text data.
+
+    Thin wrapper around the existing ``build_features`` function, returning
+    a result dict that can be threaded through the pipeline.
+
+    Returns:
+        dict with keys: fe (full feature-engineering dict from build_features).
+    """
+    fe = build_features(train_texts, test_texts, feature_mode,
+                        max_features, (1, 2), embedding_model,
+                        cache_dir=cache_dir)
+    return {"fe": fe}
+
+
+def _select_features(X_train, X_test, y_train, feature_names,
+                     selector_type="chi2", k=5000):
+    """Select top features when the feature space is large.
+
+    Args:
+        X_train: Training feature matrix.
+        X_test: Test feature matrix.
+        y_train: Training labels.
+        feature_names: List of feature name strings.
+        selector_type: 'chi2' or 'mutual_info'.
+        k: Number of features to keep.
+
+    Returns:
+        dict with keys: X_train, X_test, feature_names, selector.
+    """
+    if X_train.shape[1] <= 5000:
+        return {
+            "X_train": X_train,
+            "X_test": X_test,
+            "feature_names": feature_names,
+            "selector": None,
+        }
+
+    X_train_sel, selected_names, selector = select_top_features(
+        X_train, y_train, feature_names, k=k, method=selector_type)
+    X_test_sel = selector.transform(X_test)
+
+    return {
+        "X_train": X_train_sel,
+        "X_test": X_test_sel,
+        "feature_names": selected_names,
+        "selector": selector,
+    }
+
+
+def _create_model(model_type, n_classes, class_weight_mode=None,
+                  scale_pos_weight=None, random_state=42, n_estimators=100,
+                  auto_tune=False, optuna_trials=20, X_train=None, y_train=None):
+    """Create a classifier with optional GPU detection and Optuna tuning.
+
+    Args:
+        model_type: Requested model type string.
+        n_classes: Number of target classes.
+        class_weight_mode: 'balanced' or None.
+        scale_pos_weight: XGBoost pos_weight for binary imbalance.
+        random_state: Random seed.
+        n_estimators: Number of trees (tree-based models).
+        auto_tune: Whether to run Optuna hyperparameter search.
+        optuna_trials: Number of Optuna trials.
+        X_train: Training features (needed only when auto_tune=True).
+        y_train: Training labels (needed only when auto_tune=True).
+
+    Returns:
+        dict with keys: model, actual_type, fallback_note, tuning_report.
+    """
+    use_gpu = False
+    if model_type in ("xgboost_preferred", "xgb", "xgboost"):
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["nvidia-smi"], capture_output=True, text=True, timeout=5)
+            use_gpu = result.returncode == 0
+        except Exception:
+            use_gpu = False
+        if use_gpu:
+            print(f"  GPU detected — XGBoost will use CUDA")
+
+    model, actual_type, fallback_note = make_model(
+        model_type, random_state, class_weight_mode, n_classes,
+        n_estimators, scale_pos_weight=scale_pos_weight, use_gpu=use_gpu,
+    )
+    print(f"\n  Model: {actual_type}")
+    if fallback_note:
+        print(f"    Note: {fallback_note}")
+
+    tuning_report = None
+    if auto_tune and HAS_OPTUNA and X_train is not None and y_train is not None:
+        print(f"\n  Hyperparameter tuning with Optuna ({optuna_trials} trials)...")
+        tuning_report = run_optuna_tuning(
+            X_train, y_train, model_type, optuna_trials, random_state)
+        if tuning_report and tuning_report.get("best_params"):
+            model.set_params(**tuning_report["best_params"])
+
+    return {
+        "model": model,
+        "actual_type": actual_type,
+        "fallback_note": fallback_note,
+        "tuning_report": tuning_report,
+    }
+
+
+def _train_and_evaluate(model, X_train, y_train, X_test, y_test,
+                        class_names, n_bootstrap=1000,
+                        validation_mode="cv", cv_folds=5,
+                        random_state=42):
+    """Train the model and compute evaluation metrics.
+
+    Handles early-stopping validation split, training, prediction, metrics,
+    bootstrap CI, cross-validation, and threshold optimisation (binary).
+
+    Args:
+        model: Classifier instance (may be wrapped in ImbPipeline).
+        X_train: Training feature matrix.
+        y_train: Training labels.
+        X_test: Test feature matrix.
+        y_test: Test labels.
+        class_names: List of class name strings.
+        n_bootstrap: Number of bootstrap iterations for CI (0 to skip).
+        validation_mode: 'cv' or 'holdout'.
+        cv_folds: Number of CV folds.
+        random_state: Random seed.
+
+    Returns:
+        dict with keys: model, y_pred, y_prob, metrics, training_time,
+                        cv_report, threshold_report.
+    """
+    n_classes = len(class_names)
+    actual_type = None
+    if hasattr(model, "steps"):
+        actual_type = type(model.steps[-1][1]).__name__
+    elif hasattr(model, "__class__"):
+        actual_type = model.__class__.__name__
+
+    # Determine if we need an early-stopping validation split
+    is_xgb = "xgb" in actual_type.lower() if actual_type else False
+    if is_xgb and len(y_train) >= 100:
+        _es_idx = np.arange(len(y_train))
+        try:
+            _train_idx_inner, val_idx = train_test_split(
+                _es_idx, y_train, test_size=0.15,
+                random_state=random_state, stratify=y_train)
+            train_idx_inner = np.sort(_train_idx_inner)
+            val_idx = np.sort(val_idx)
+        except ValueError:
+            rng = np.random.RandomState(random_state)
+            n_val = max(1, int(len(y_train) * 0.15))
+            val_idx = rng.choice(len(y_train), n_val, replace=False)
+            train_idx_inner = np.array(
+                [i for i in range(len(y_train)) if i not in val_idx])
+        print(f"  Early stopping split: train={len(train_idx_inner)}, "
+              f"val={len(val_idx)} (stratified)")
+        X_val = X_train[val_idx]
+        y_val = y_train[val_idx]
+        X_train_fit = X_train[train_idx_inner]
+        y_train_fit = y_train[train_idx_inner]
+    else:
+        X_train_fit, y_train_fit = X_train, y_train
+        X_val = None
+
+    # Train
+    print(f"\n  Training...")
+    t0 = time.time()
+    fit_kwargs = {}
+    if is_xgb and X_val is not None:
+        fit_kwargs["eval_set"] = [(X_val, y_val)]
+        fit_kwargs["verbose"] = False
+        if hasattr(model, "set_params"):
+            try:
+                model.set_params(early_stopping_rounds=50)
+            except Exception:
+                pass
+    model.fit(X_train_fit, y_train_fit, **fit_kwargs)
+    train_time = time.time() - t0
+    print(f"  Training done in {train_time:.2f}s")
+    if hasattr(model, "set_params"):
+        try:
+            model.set_params(early_stopping_rounds=0)
+        except Exception:
+            pass
+
+    # Predict
+    y_pred = model.predict(X_test)
+    try:
+        y_prob = model.predict_proba(X_test)
+    except Exception:
+        y_prob = None
+
+    # Metrics
+    metrics = compute_metrics(y_test, y_pred, y_prob, n_classes)
+    print(f"\n  Test Metrics:")
+    print(f"    Accuracy:     {metrics['accuracy']:.4f}")
+    print(f"    Macro F1:     {metrics['macro_f1']:.4f}")
+    print(f"    Weighted F1:  {metrics['weighted_f1']:.4f}")
+    print(f"    Kappa:        {metrics['kappa']:.4f}")
+    print(f"    MCC:          {metrics['mcc']:.4f}")
+    if metrics.get("roc_auc"):
+        print(f"    ROC-AUC:      {metrics['roc_auc']:.4f}")
+    if metrics.get("brier"):
+        print(f"    Brier score:  {metrics['brier']:.4f}")
+
+    # Per-class metrics
+    print(f"\n  Per-Class Metrics:")
+    print(f"  {'Class':<15} {'Precision':>10} {'Recall':>10} {'F1':>8} {'Support':>8}")
+    print(f"  {'-'*15} {'-'*10} {'-'*10} {'-'*8} {'-'*8}")
+    for cls, cm in metrics["per_class"].items():
+        cname = class_names[int(cls)] if int(cls) < len(class_names) else cls
+        print(f"  {cname:<15} {cm['precision']:>10.4f} {cm['recall']:>10.4f} "
+              f"{cm['f1']:>8.4f} {cm['support']:>8}")
+
+    print(f"\n  {classification_report(y_test, y_pred, target_names=class_names)}")
+
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    print(f"\n  Confusion Matrix:")
+    print(f"  {'':>12}", end="")
+    for name in class_names:
+        print(f" {name:>10}", end="")
+    print()
+    for i, name in enumerate(class_names):
+        print(f"  {name:<10}", end="")
+        for j in range(len(class_names)):
+            print(f" {cm[i, j]:>10}", end="")
+        print()
+
+    # Bootstrap CI
+    if n_bootstrap > 0:
+        ci = bootstrap_ci(y_test, y_pred, n_bootstrap)
+        print(f"\n  Bootstrap 95% CI (macro-F1): "
+              f"[{ci['ci_low']:.4f}, {ci['ci_high']:.4f}] (mean={ci['mean']:.4f})")
+        metrics["bootstrap_ci"] = ci
+
+    # Cross-validation
+    cv_report = None
+    if validation_mode == "cv" and cv_folds > 0:
+        cv_report = run_cross_validation(
+            X_train, y_train, model, cv_folds, groups=None, parallel=True)
+
+    # Threshold optimisation (binary only)
+    threshold_report = None
+    if n_classes == 2 and y_prob is not None:
+        threshold_report = run_threshold_optimization(y_test, y_prob)
+        print(f"\n  Optimal threshold: {threshold_report['best_threshold']:.4f} "
+              f"(best F1: {threshold_report['best_f1']:.4f})")
+
+    return {
+        "model": model,
+        "y_pred": y_pred,
+        "y_prob": y_prob,
+        "metrics": metrics,
+        "training_time": train_time,
+        "cv_report": cv_report,
+        "threshold_report": threshold_report,
+    }
+
+
+def _run_calibration(model, X_train, y_train, X_test, y_test, n_classes):
+    """Run probability calibration via CalibratedClassifierCV (binary only).
+
+    Returns:
+        dict with keys: model, y_prob, y_pred, metrics, calibration_report.
+        On failure, returns calibration_report with error info and leaves
+        model/y_prob/y_pred/metrics unchanged.
+    """
+    result = {
+        "model": model,
+        "y_prob": None,
+        "y_pred": None,
+        "metrics": None,
+        "calibration_report": None,
+    }
+
+    if not (n_classes == 2):
+        return result
+
+    from sklearn.calibration import calibration_curve
+    print(f"\n  Calibration: wrapping model in CalibratedClassifierCV...")
+    try:
+        model_for_cal = skclone(model)
+        if hasattr(model_for_cal, "set_params"):
+            model_for_cal.set_params(early_stopping_rounds=0)
+        cal_model = CalibratedClassifierCV(model_for_cal, method="sigmoid", cv=3)
+        cal_model.fit(X_train, y_train)
+        cal_y_prob = cal_model.predict_proba(X_test)
+        prob_true, prob_pred = calibration_curve(
+            y_test, cal_y_prob[:, 1], n_bins=10)
+        ece = np.mean(np.abs(prob_true - prob_pred)).item()
+        print(f"    Calibrated ECE: {ece:.4f}")
+        y_pred = cal_model.predict(X_test)
+        metrics = compute_metrics(y_test, y_pred, cal_y_prob, n_classes)
+        result.update(model=cal_model, y_prob=cal_y_prob,
+                      y_pred=y_pred, metrics=metrics)
+    except Exception as e:
+        print(f"    [!] Calibration failed: {e}. Using uncalibrated model.")
+        prob_true, prob_pred = calibration_curve(
+            y_test, model.predict_proba(X_test)[:, 1], n_bins=10)
+        ece = np.mean(np.abs(prob_true - prob_pred)).item()
+
+    result["calibration_report"] = {
+        "ece": round(ece, 4),
+        "prob_true": prob_true.tolist(),
+        "prob_pred": prob_pred.tolist(),
+    }
+    print(f"    Expected Calibration Error: {ece:.4f}")
+    if ece > 0.10:
+        print(f"    ⚠ Calibration error > 0.10 — calibration may need more data")
+    return result
+
+
+def _run_cleanlab(model, X_train, y_train, class_names, train_texts):
+    """Run Cleanlab label-quality audit on the training set.
+
+    Returns:
+        dict with keys: cleanlab_report (or None on failure).
+    """
+    if not HAS_CLEANLAB:
+        return {"cleanlab_report": None}
+
+    print(f"\n  Cleanlab label quality audit...")
+    try:
+        from cleanlab.filter import find_label_issues
+        from cleanlab.rank import get_label_quality_scores
+
+        oof_pred_probs = cross_val_predict(
+            model, X_train, y_train, cv=3, method="predict_proba")
+        label_issues = find_label_issues(
+            y_train, oof_pred_probs, return_indices_ranked_by="self_confidence")
+        quality_scores = get_label_quality_scores(y_train, oof_pred_probs)
+        issue_examples = []
+        for idx in label_issues[:20]:
+            issue_examples.append({
+                "index": int(idx),
+                "text": train_texts[idx][:200],
+                "current_label": class_names[y_train[idx]],
+                "quality_score": round(float(quality_scores[idx]), 4),
+            })
+        cleanlab_report = {
+            "n_label_issues": len(label_issues),
+            "n_total": len(y_train),
+            "issue_pct": round(len(label_issues) / len(y_train) * 100, 2),
+            "examples": issue_examples,
+        }
+        print(f"    Label issues found: {cleanlab_report['n_label_issues']} "
+              f"({cleanlab_report['issue_pct']:.1f}%)")
+        return {"cleanlab_report": cleanlab_report}
+    except Exception as e:
+        print(f"    [!] Cleanlab audit failed: {e}")
+        return {"cleanlab_report": None}
+
+
+def _run_explainability(model, X_test, feature_names, explain_mode="shap"):
+    """Generate model explanations (SHAP or permutation importance).
+
+    Returns:
+        dict with keys: explanation.
+    """
+    if explain_mode == "none":
+        return {"explanation": None}
+
+    explanation = explain_model(model, X_test[:500], None, feature_names,
+                                explain_mode, 30)
+    return {"explanation": explanation}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 6.1: TRAINING PIPELINE (ORCHESTRATOR)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def train_classifier(df, text_col="text", label_col="label",
