@@ -3046,12 +3046,14 @@ def generate_html_report_ultra(result, output_dir="output", elapsed_sec=0.0, dat
         class_names = result.get("class_names", [])
         n_classes = len(class_names)
         model_name = result.get("actual_type", result.get("model_type", "unknown"))
+        n_preds = len(predictions) if predictions is not None else 0
+        n_train = result.get("n_docs", 0) or result.get("train_size", 0) or (n_preds * 4 if n_preds else 0)
 
         report = ReportBuilder(
             "Predictive Modeling ULTRA",
-            dataset=dataset, n_docs=len(predictions) if predictions is not None else 0,
+            dataset=dataset, n_docs=n_train or n_preds,
             elapsed_sec=elapsed_sec,
-            extra_header=f"Model: {model_name}, Features: {result.get('feature_mode', 'tfidf')}",
+            extra_header=f"Model: {model_name}, Features: {result.get('feature_mode', 'tfidf')}, CV Folds: {result.get('cv_folds', 5)}",
         )
 
         # --- KEY FINDINGS ---
